@@ -22,6 +22,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import contextlib
 import datetime
 import json
 import multiprocessing
@@ -35,9 +36,16 @@ from absl import flags
 import tensorflow as tf
 from tensorflow.python.client import device_lib
 
+from official.utils.logs import cloud_lib
+
 METRIC_LOG_FILE_NAME = "metric.log"
 BENCHMARK_RUN_LOG_FILE_NAME = "benchmark_run.log"
 _DATE_TIME_FORMAT_PATTERN = "%Y-%m-%dT%H:%M:%S.%fZ"
+GCP_TEST_ENV = "GCP"
+RUN_STATUS_SUCCESS = "success"
+RUN_STATUS_FAILURE = "failure"
+RUN_STATUS_RUNNING = "running"
+
 
 FLAGS = flags.FLAGS
 
@@ -66,6 +74,7 @@ def config_benchmark_logger(flag_obj=None):
           bigquery_uploader=bq_uploader,
           bigquery_data_set=flag_obj.bigquery_data_set,
           bigquery_run_table=flag_obj.bigquery_run_table,
+          bigquery_run_status_table=flag_obj.bigquery_run_status_table,
           bigquery_metric_table=flag_obj.bigquery_metric_table,
           run_id=str(uuid.uuid4()))
     else:
@@ -83,6 +92,19 @@ def get_benchmark_logger():
   return _benchmark_logger
 
 
+@contextlib.contextmanager
+def benchmark_context(flag_obj):
+  """Context of benchmark, which will update status of the run accordingly."""
+  benchmark_logger = config_benchmark_logger(flag_obj)
+  try:
+    yield
+    benchmark_logger.on_finish(RUN_STATUS_SUCCESS)
+  except Exception:  # pylint: disable=broad-except
+    # Catch all the exception, update the run status to be failure, and re-raise
+    benchmark_logger.on_finish(RUN_STATUS_FAILURE)
+    raise
+
+
 class BaseBenchmarkLogger(object):
   """Class to log the benchmark information to STDOUT."""
 
@@ -97,12 +119,13 @@ class BaseBenchmarkLogger(object):
       eval_results: dict, the result of evaluate.
     """
     if not isinstance(eval_results, dict):
-      tf.logging.warning("eval_results should be dictionary for logging. "
-                         "Got %s", type(eval_results))
+      tf.compat.v1.logging.warning(
+          "eval_results should be dictionary for logging. Got %s",
+          type(eval_results))
       return
-    global_step = eval_results[tf.GraphKeys.GLOBAL_STEP]
+    global_step = eval_results[tf.compat.v1.GraphKeys.GLOBAL_STEP]
     for key in sorted(eval_results):
-      if key != tf.GraphKeys.GLOBAL_STEP:
+      if key != tf.compat.v1.GraphKeys.GLOBAL_STEP:
         self.log_metric(key, eval_results[key], global_step=global_step)
 
   def log_metric(self, name, value, unit=None, global_step=None, extras=None):
@@ -121,11 +144,15 @@ class BaseBenchmarkLogger(object):
     """
     metric = _process_metric_to_json(name, value, unit, global_step, extras)
     if metric:
-      tf.logging.info("Benchmark metric: %s", metric)
+      tf.compat.v1.logging.info("Benchmark metric: %s", metric)
 
-  def log_run_info(self, model_name, dataset_name, run_params):
-    tf.logging.info("Benchmark run: %s",
-                    _gather_run_info(model_name, dataset_name, run_params))
+  def log_run_info(self, model_name, dataset_name, run_params, test_id=None):
+    tf.compat.v1.logging.info(
+        "Benchmark run: %s", _gather_run_info(model_name, dataset_name,
+                                              run_params, test_id))
+
+  def on_finish(self, status):
+    pass
 
 
 class BenchmarkFileLogger(BaseBenchmarkLogger):
@@ -134,8 +161,10 @@ class BenchmarkFileLogger(BaseBenchmarkLogger):
   def __init__(self, logging_dir):
     super(BenchmarkFileLogger, self).__init__()
     self._logging_dir = logging_dir
-    if not tf.gfile.IsDirectory(self._logging_dir):
-      tf.gfile.MakeDirs(self._logging_dir)
+    if not tf.io.gfile.isdir(self._logging_dir):
+      tf.io.gfile.makedirs(self._logging_dir)
+    self._metric_file_handler = tf.io.gfile.GFile(
+        os.path.join(self._logging_dir, METRIC_LOG_FILE_NAME), "a")
 
   def log_metric(self, name, value, unit=None, global_step=None, extras=None):
     """Log the benchmark metric information to local file.
@@ -153,16 +182,16 @@ class BenchmarkFileLogger(BaseBenchmarkLogger):
     """
     metric = _process_metric_to_json(name, value, unit, global_step, extras)
     if metric:
-      with tf.gfile.GFile(
-          os.path.join(self._logging_dir, METRIC_LOG_FILE_NAME), "a") as f:
-        try:
-          json.dump(metric, f)
-          f.write("\n")
-        except (TypeError, ValueError) as e:
-          tf.logging.warning("Failed to dump metric to log file: "
-                             "name %s, value %s, error %s", name, value, e)
+      try:
+        json.dump(metric, self._metric_file_handler)
+        self._metric_file_handler.write("\n")
+        self._metric_file_handler.flush()
+      except (TypeError, ValueError) as e:
+        tf.compat.v1.logging.warning(
+            "Failed to dump metric to log file: name %s, value %s, error %s",
+            name, value, e)
 
-  def log_run_info(self, model_name, dataset_name, run_params):
+  def log_run_info(self, model_name, dataset_name, run_params, test_id=None):
     """Collect most of the TF runtime information for the local env.
 
     The schema of the run info follows official/benchmark/datastore/schema.
@@ -172,17 +201,23 @@ class BenchmarkFileLogger(BaseBenchmarkLogger):
       dataset_name: string, the name of dataset for training and evaluation.
       run_params: dict, the dictionary of parameters for the run, it could
         include hyperparameters or other params that are important for the run.
+      test_id: string, the unique name of the test run by the combination of key
+        parameters, eg batch size, num of GPU. It is hardware independent.
     """
-    run_info = _gather_run_info(model_name, dataset_name, run_params)
+    run_info = _gather_run_info(model_name, dataset_name, run_params, test_id)
 
-    with tf.gfile.GFile(os.path.join(
+    with tf.io.gfile.GFile(os.path.join(
         self._logging_dir, BENCHMARK_RUN_LOG_FILE_NAME), "w") as f:
       try:
         json.dump(run_info, f)
         f.write("\n")
       except (TypeError, ValueError) as e:
-        tf.logging.warning("Failed to dump benchmark run info to log file: %s",
-                           e)
+        tf.compat.v1.logging.warning(
+            "Failed to dump benchmark run info to log file: %s", e)
+
+  def on_finish(self, status):
+    self._metric_file_handler.flush()
+    self._metric_file_handler.close()
 
 
 class BenchmarkBigQueryLogger(BaseBenchmarkLogger):
@@ -192,12 +227,14 @@ class BenchmarkBigQueryLogger(BaseBenchmarkLogger):
                bigquery_uploader,
                bigquery_data_set,
                bigquery_run_table,
+               bigquery_run_status_table,
                bigquery_metric_table,
                run_id):
     super(BenchmarkBigQueryLogger, self).__init__()
     self._bigquery_uploader = bigquery_uploader
     self._bigquery_data_set = bigquery_data_set
     self._bigquery_run_table = bigquery_run_table
+    self._bigquery_run_status_table = bigquery_run_status_table
     self._bigquery_metric_table = bigquery_metric_table
     self._run_id = run_id
 
@@ -225,7 +262,7 @@ class BenchmarkBigQueryLogger(BaseBenchmarkLogger):
            self._run_id,
            [metric]))
 
-  def log_run_info(self, model_name, dataset_name, run_params):
+  def log_run_info(self, model_name, dataset_name, run_params, test_id=None):
     """Collect most of the TF runtime information for the local env.
 
     The schema of the run info follows official/benchmark/datastore/schema.
@@ -235,8 +272,10 @@ class BenchmarkBigQueryLogger(BaseBenchmarkLogger):
       dataset_name: string, the name of dataset for training and evaluation.
       run_params: dict, the dictionary of parameters for the run, it could
         include hyperparameters or other params that are important for the run.
+      test_id: string, the unique name of the test run by the combination of key
+        parameters, eg batch size, num of GPU. It is hardware independent.
     """
-    run_info = _gather_run_info(model_name, dataset_name, run_params)
+    run_info = _gather_run_info(model_name, dataset_name, run_params, test_id)
     # Starting new thread for bigquery upload in case it might take long time
     # and impact the benchmark and performance measurement. Starting a new
     # thread might have potential performance impact for model that run on CPU.
@@ -246,22 +285,36 @@ class BenchmarkBigQueryLogger(BaseBenchmarkLogger):
          self._bigquery_run_table,
          self._run_id,
          run_info))
+    thread.start_new_thread(
+        self._bigquery_uploader.insert_run_status,
+        (self._bigquery_data_set,
+         self._bigquery_run_status_table,
+         self._run_id,
+         RUN_STATUS_RUNNING))
+
+  def on_finish(self, status):
+    self._bigquery_uploader.update_run_status(
+        self._bigquery_data_set,
+        self._bigquery_run_status_table,
+        self._run_id,
+        status)
 
 
-def _gather_run_info(model_name, dataset_name, run_params):
+def _gather_run_info(model_name, dataset_name, run_params, test_id):
   """Collect the benchmark run information for the local environment."""
   run_info = {
       "model_name": model_name,
       "dataset": {"name": dataset_name},
       "machine_config": {},
+      "test_id": test_id,
       "run_date": datetime.datetime.utcnow().strftime(
           _DATE_TIME_FORMAT_PATTERN)}
   _collect_tensorflow_info(run_info)
   _collect_tensorflow_environment_variables(run_info)
   _collect_run_params(run_info, run_params)
   _collect_cpu_info(run_info)
-  _collect_gpu_info(run_info)
   _collect_memory_info(run_info)
+  _collect_test_environment(run_info)
   return run_info
 
 
@@ -269,7 +322,7 @@ def _process_metric_to_json(
     name, value, unit=None, global_step=None, extras=None):
   """Validate the metric data and generate JSON for insert."""
   if not isinstance(value, numbers.Number):
-    tf.logging.warning(
+    tf.compat.v1.logging.warning(
         "Metric value to log should be a number. Got %s", type(value))
     return None
 
@@ -286,7 +339,7 @@ def _process_metric_to_json(
 
 def _collect_tensorflow_info(run_info):
   run_info["tensorflow_version"] = {
-      "version": tf.VERSION, "git_hash": tf.GIT_VERSION}
+      "version": tf.version.VERSION, "git_hash": tf.version.GIT_VERSION}
 
 
 def _collect_run_params(run_info, run_params):
@@ -330,25 +383,8 @@ def _collect_cpu_info(run_info):
 
     run_info["machine_config"]["cpu_info"] = cpu_info
   except ImportError:
-    tf.logging.warn("'cpuinfo' not imported. CPU info will not be logged.")
-
-
-def _collect_gpu_info(run_info):
-  """Collect local GPU information by TF device library."""
-  gpu_info = {}
-  local_device_protos = device_lib.list_local_devices()
-
-  gpu_info["count"] = len([d for d in local_device_protos
-                           if d.device_type == "GPU"])
-  # The device description usually is a JSON string, which contains the GPU
-  # model info, eg:
-  # "device: 0, name: Tesla P100-PCIE-16GB, pci bus id: 0000:00:04.0"
-  for d in local_device_protos:
-    if d.device_type == "GPU":
-      gpu_info["model"] = _parse_gpu_model(d.physical_device_desc)
-      # Assume all the GPU connected are same model
-      break
-  run_info["machine_config"]["gpu_info"] = gpu_info
+    tf.compat.v1.logging.warn(
+        "'cpuinfo' not imported. CPU info will not be logged.")
 
 
 def _collect_memory_info(run_info):
@@ -360,7 +396,15 @@ def _collect_memory_info(run_info):
     run_info["machine_config"]["memory_total"] = vmem.total
     run_info["machine_config"]["memory_available"] = vmem.available
   except ImportError:
-    tf.logging.warn("'psutil' not imported. Memory info will not be logged.")
+    tf.compat.v1.logging.warn(
+        "'psutil' not imported. Memory info will not be logged.")
+
+
+def _collect_test_environment(run_info):
+  """Detect the local environment, eg GCE, AWS or DGX, etc."""
+  if cloud_lib.on_gcp():
+    run_info["test_environment"] = GCP_TEST_ENV
+  # TODO(scottzhu): Add more testing env detection for other platform
 
 
 def _parse_gpu_model(physical_device_desc):

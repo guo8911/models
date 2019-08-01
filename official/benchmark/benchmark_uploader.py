@@ -27,6 +27,7 @@ from __future__ import print_function
 import json
 
 from google.cloud import bigquery
+from google.cloud import exceptions
 
 import tensorflow as tf
 
@@ -97,7 +98,7 @@ class BigQueryUploader(object):
         this is a UUID4 format.
       run_json_file: string, the file path that contains the run JSON data.
     """
-    with tf.gfile.GFile(run_json_file) as f:
+    with tf.io.gfile.GFile(run_json_file) as f:
       benchmark_json = json.load(f)
       self.upload_benchmark_run_json(
           dataset_name, table_name, run_id, benchmark_json)
@@ -117,7 +118,7 @@ class BigQueryUploader(object):
       metric_json_file: string, the file path that contains the metric JSON
         data.
     """
-    with tf.gfile.GFile(metric_json_file) as f:
+    with tf.io.gfile.GFile(metric_json_file) as f:
       metrics = []
       for line in f:
         metrics.append(json.loads(line.strip()))
@@ -132,3 +133,25 @@ class BigQueryUploader(object):
     if errors:
       tf.logging.error(
           "Failed to upload benchmark info to bigquery: {}".format(errors))
+
+  def insert_run_status(self, dataset_name, table_name, run_id, run_status):
+    """Insert the run status in to Bigquery run status table."""
+    query = ("INSERT {ds}.{tb} "
+             "(run_id, status) "
+             "VALUES('{rid}', '{status}')").format(
+                 ds=dataset_name, tb=table_name, rid=run_id, status=run_status)
+    try:
+      self._bq_client.query(query=query).result()
+    except exceptions.GoogleCloudError as e:
+      tf.logging.error("Failed to insert run status: %s", e)
+
+  def update_run_status(self, dataset_name, table_name, run_id, run_status):
+    """Update the run status in in Bigquery run status table."""
+    query = ("UPDATE {ds}.{tb} "
+             "SET status = '{status}' "
+             "WHERE run_id = '{rid}'").format(
+                 ds=dataset_name, tb=table_name, status=run_status, rid=run_id)
+    try:
+      self._bq_client.query(query=query).result()
+    except exceptions.GoogleCloudError as e:
+      tf.logging.error("Failed to update run status: %s", e)
